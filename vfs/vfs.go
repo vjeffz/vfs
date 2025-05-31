@@ -1,4 +1,3 @@
-// File: vfs/vfs.go
 package vfs
 
 import (
@@ -6,24 +5,23 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
+	"net/url"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 const (
-	defaultConcurrency   = 8
-	s3MaxKeyLengthBytes  = 1024
-	maxIndexLen          = 6
+	s3MaxKeyLengthBytes = 1024
+	maxIndexLen         = 6
+	defaultConcurrency  = 8
 )
 
 type VFS struct {
@@ -47,26 +45,28 @@ func (v *VFS) Encode(inputPath, s3URI string) error {
 	if err != nil {
 		return err
 	}
+
 	chunkSize := calculateChunkSize(prefix)
 	if chunkSize < 1 {
-		return fmt.Errorf("calculated chunk size is too small")
+		return fmt.Errorf("calculated chunk size is too small for S3 key constraint")
 	}
-	inputFile, err := os.Open(inputPath)
+
+	file, err := os.Open(inputPath)
 	if err != nil {
 		return err
 	}
-	defer inputFile.Close()
+	defer file.Close()
 
-	stat, _ := inputFile.Stat()
-	totalSize := stat.Size()
-	totalChunks := int(totalSize / int64(chunkSize))
-	if totalSize%int64(chunkSize) != 0 {
+	stat, _ := file.Stat()
+	totalChunks := int(stat.Size()) / chunkSize
+	if stat.Size()%int64(chunkSize) != 0 {
 		totalChunks++
 	}
-	chunks := make([][]byte, 0, totalChunks)
+
+	var chunks [][]byte
 	buf := make([]byte, chunkSize)
 	for {
-		n, err := inputFile.Read(buf)
+		n, err := file.Read(buf)
 		if n > 0 {
 			copyBuf := make([]byte, n)
 			copy(copyBuf, buf[:n])
@@ -80,22 +80,23 @@ func (v *VFS) Encode(inputPath, s3URI string) error {
 		}
 	}
 
-	sem := make(chan struct{}, v.concurrency)
+	fmt.Printf("Uploading %d chunks...\n", len(chunks))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, v.concurrency)
 	var errMu sync.Mutex
 	var firstErr error
 
 	for i, chunk := range chunks {
 		sem <- struct{}{}
 		wg.Add(1)
-		go func(i int, data []byte) {
+		go func(index int, data []byte) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			encoded := base64.StdEncoding.EncodeToString(data)
-			key := path.Join(prefix, fmt.Sprintf("%d-%s", i+1, encoded))
+			encoded := base64.RawURLEncoding.EncodeToString(data)
+			key := path.Join(prefix, fmt.Sprintf("%d-%s", index+1, encoded))
 			_, err := v.client.PutObject(context.TODO(), &s3.PutObjectInput{
-				Bucket: aws.String(bucket),
-				Key:    aws.String(key),
+				Bucket: &bucket,
+				Key:    &key,
 				Body:   nil,
 			})
 			if err != nil {
@@ -104,10 +105,12 @@ func (v *VFS) Encode(inputPath, s3URI string) error {
 					firstErr = err
 				}
 				errMu.Unlock()
+				return
 			}
-			fmt.Printf("\rUploaded: %d/%d", i+1, len(chunks))
+			fmt.Printf("\rUploaded: %d/%d", index+1, len(chunks))
 		}(i, chunk)
 	}
+
 	wg.Wait()
 	fmt.Println("\n✅ Upload complete.")
 	return firstErr
@@ -118,58 +121,69 @@ func (v *VFS) Restore(s3URI, outputPath string) error {
 	if err != nil {
 		return err
 	}
+
 	var chunks []struct {
 		index   int
 		encoded string
 	}
-	paginator := s3.NewListObjectsV2Paginator(v.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
+
+	p := s3.NewListObjectsV2Paginator(v.client, &s3.ListObjectsV2Input{
+		Bucket: &bucket,
+		Prefix: &prefix,
 	})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(context.TODO())
+
+	for p.HasMorePages() {
+		page, err := p.NextPage(context.TODO())
 		if err != nil {
 			return err
 		}
 		for _, obj := range page.Contents {
-			key := strings.TrimPrefix(*obj.Key, prefix)
-			key = strings.TrimPrefix(key, "/")
-			parts := strings.SplitN(key, "-", 2)
+			name := strings.TrimPrefix(*obj.Key, prefix)
+			name = strings.TrimPrefix(name, "/")
+			parts := strings.SplitN(name, "-", 2)
 			if len(parts) != 2 {
 				continue
 			}
-			idx, err := strconv.Atoi(parts[0])
+			index, err := strconv.Atoi(parts[0])
 			if err != nil {
 				continue
 			}
 			chunks = append(chunks, struct {
 				index   int
 				encoded string
-			}{idx, parts[1]})
+			}{index, parts[1]})
 		}
 	}
+
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].index < chunks[j].index
 	})
-	os.MkdirAll(path.Dir(outputPath), 0755)
+
+	if err := os.MkdirAll(path.Dir(outputPath), 0755); err != nil {
+		return err
+	}
+
 	out, err := os.Create(outputPath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	results := make([][]byte, len(chunks))
-	sem := make(chan struct{}, v.concurrency)
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, v.concurrency)
+	results := make([][]byte, len(chunks))
 	var errMu sync.Mutex
 	var firstErr error
-	for i, c := range chunks {
+
+	fmt.Printf("Downloading %d chunks...\n", len(chunks))
+
+	for i, chunk := range chunks {
 		sem <- struct{}{}
 		wg.Add(1)
-		go func(i int, enc string) {
+		go func(i int, encoded string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			decoded, err := base64.StdEncoding.DecodeString(enc)
+			data, err := base64.RawURLEncoding.DecodeString(encoded)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -178,18 +192,23 @@ func (v *VFS) Restore(s3URI, outputPath string) error {
 				errMu.Unlock()
 				return
 			}
-			results[i] = decoded
+			results[i] = data
 			fmt.Printf("\rDownloaded: %d/%d", i+1, len(chunks))
-		}(i, c.encoded)
+		}(i, chunk.encoded)
 	}
+
 	wg.Wait()
 	fmt.Println("\n✅ Download complete.")
 	if firstErr != nil {
 		return firstErr
 	}
+
 	for _, data := range results {
-		out.Write(data)
+		if _, err := out.Write(data); err != nil {
+			return err
+		}
 	}
+	fmt.Printf("Restored file written to: %s\n", outputPath)
 	return nil
 }
 
@@ -198,31 +217,33 @@ func (v *VFS) Delete(s3URI string) error {
 	if err != nil {
 		return err
 	}
-	paginator := s3.NewListObjectsV2Paginator(v.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
+
+	p := s3.NewListObjectsV2Paginator(v.client, &s3.ListObjectsV2Input{
+		Bucket: &bucket,
+		Prefix: &prefix,
 	})
+
 	deleted := 0
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(context.TODO())
+	for p.HasMorePages() {
+		page, err := p.NextPage(context.TODO())
 		if err != nil {
 			return err
 		}
-		var objs []s3types.ObjectIdentifier
+		var toDelete []s3types.ObjectIdentifier
 		for _, obj := range page.Contents {
-			objs = append(objs, s3types.ObjectIdentifier{Key: obj.Key})
+			toDelete = append(toDelete, s3types.ObjectIdentifier{Key: obj.Key})
 		}
-		if len(objs) == 0 {
+		if len(toDelete) == 0 {
 			break
 		}
 		_, err = v.client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
-			Bucket: aws.String(bucket),
-			Delete: &s3types.Delete{Objects: objs},
+			Bucket: &bucket,
+			Delete: &s3types.Delete{Objects: toDelete},
 		})
 		if err != nil {
 			return err
 		}
-		deleted += len(objs)
+		deleted += len(toDelete)
 		fmt.Printf("\rDeleted: %d", deleted)
 	}
 	fmt.Println("\n✅ Delete complete.")
@@ -233,12 +254,12 @@ func parseS3Path(s3Path string) (string, string, error) {
 	if !strings.HasPrefix(s3Path, "s3://") {
 		return "", "", fmt.Errorf("must start with s3://")
 	}
-	u, err := url.Parse(s3Path)
+	parsed, err := url.Parse(s3Path)
 	if err != nil {
 		return "", "", err
 	}
-	bucket := u.Host
-	prefix := strings.TrimLeft(u.Path, "/")
+	bucket := parsed.Host
+	prefix := strings.TrimLeft(parsed.Path, "/")
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -255,9 +276,6 @@ func calculateChunkSize(prefix string) int {
 
 func getConcurrency() int {
 	val := os.Getenv("S3_CONCURRENCY")
-	if val == "" {
-		return defaultConcurrency
-	}
 	n, err := strconv.Atoi(val)
 	if err != nil || n <= 0 {
 		return defaultConcurrency
