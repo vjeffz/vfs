@@ -1,12 +1,13 @@
 package vfs
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
-	"os"
 	"net/url"
+	"os"
 	"path"
 	"sort"
 	"strconv"
@@ -40,10 +41,30 @@ func New() (*VFS, error) {
 	}, nil
 }
 
-func (v *VFS) Encode(inputPath, s3URI string) error {
+func (v *VFS) Encode(inputPath, s3URI string, force bool) error {
 	bucket, prefix, err := parseS3Path(s3URI)
 	if err != nil {
 		return err
+	}
+
+	exists, err := v.hasObjects(bucket, prefix)
+	if err != nil {
+		return err
+	}
+	if exists && !force {
+		fmt.Printf("⚠️  S3 path s3://%s/%s already contains data. Overwrite? [y/N]: ", bucket, prefix)
+		reader := bufio.NewReader(os.Stdin)
+		resp, _ := reader.ReadString('\n')
+		resp = strings.ToLower(strings.TrimSpace(resp))
+		if resp != "y" {
+			fmt.Println("✋ Upload canceled.")
+			return nil
+		}
+	}
+	if exists && force {
+		if err := v.Delete(fmt.Sprintf("s3://%s/%s", bucket, prefix)); err != nil {
+			return fmt.Errorf("failed to delete existing prefix: %w", err)
+		}
 	}
 
 	chunkSize := calculateChunkSize(prefix)
@@ -159,6 +180,12 @@ func (v *VFS) Restore(s3URI, outputPath string) error {
 		return chunks[i].index < chunks[j].index
 	})
 
+	// ✅ Abort restore if no chunks
+	if len(chunks) == 0 {
+		fmt.Printf("⚠️  No chunks found at s3://%s/%s. Restore aborted.\n", bucket, prefix)
+		return nil
+	}
+
 	if err := os.MkdirAll(path.Dir(outputPath), 0755); err != nil {
 		return err
 	}
@@ -248,6 +275,20 @@ func (v *VFS) Delete(s3URI string) error {
 	}
 	fmt.Println("\n✅ Delete complete.")
 	return nil
+}
+
+func (v *VFS) hasObjects(bucket, prefix string) (bool, error) {
+	maxKeys := int32(1)
+	p := s3.NewListObjectsV2Paginator(v.client, &s3.ListObjectsV2Input{
+		Bucket:  &bucket,
+		Prefix:  &prefix,
+		MaxKeys: &maxKeys,
+	})
+	page, err := p.NextPage(context.TODO())
+	if err != nil {
+		return false, err
+	}
+	return len(page.Contents) > 0, nil
 }
 
 func parseS3Path(s3Path string) (string, string, error) {

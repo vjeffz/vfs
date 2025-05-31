@@ -10,7 +10,7 @@ import (
 
 func usage() {
 	fmt.Println(`Usage:
-  vfs encode <inputfile> s3://bucket/prefix/
+  vfs encode <inputfile> s3://bucket/prefix/ [--force]
   vfs restore s3://bucket/prefix/ <outputfile>
   vfs delete s3://bucket/prefix/`)
 }
@@ -28,11 +28,12 @@ func main() {
 
 	switch os.Args[1] {
 	case "encode":
-		if len(os.Args) != 4 {
+		force := len(os.Args) == 5 && os.Args[4] == "--force"
+		if len(os.Args) != 4 && !force {
 			usage()
 			os.Exit(1)
 		}
-		err = v.Encode(os.Args[2], os.Args[3])
+		err = v.Encode(os.Args[2], os.Args[3], force)
 	case "restore":
 		if len(os.Args) != 4 {
 			usage()
