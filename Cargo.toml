@@ -1,0 +1,24 @@
+[package]
+name = "vfs"
+version = "0.1.0"
+edition = "2021"
+description = "Virtual File Splitter - Encode files as base64 chunks in S3 object keys"
+license = "MIT"
+
+[[bin]]
+name = "vfs"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.28", features = ["full"] }
+aws-config = "0.55"
+aws-sdk-s3 = "0.35"
+clap = { version = "4.3", features = ["derive"] }
+anyhow = "1.0"
+base64 = "0.20"
+url = "2.4"
+futures = "0.3"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tempfile = "3.8"
